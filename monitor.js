@@ -9,6 +9,25 @@ const PASSWORD = process.env.PASSWORD;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const MAX_WEEKS = parseInt(process.env.MAX_WEEKS || '4', 10);
+const HEADLESS = process.env.HEADLESS !== 'false'; // Default to headless, but allow local headful debugging
+
+function parseDateFromString(str) {
+  const match = str.match(/(\d{4})\.(\d{2})\.(\d{2})/);
+  if (!match) return null;
+  return new Date(parseInt(match[1], 10), parseInt(match[2], 10) - 1, parseInt(match[3], 10));
+}
+
+function isWithinWeeks(date, maxWeeks) {
+  if (!date) return false;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  
+  const diffTime = date.getTime() - today.getTime();
+  const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+  const diffWeeks = diffDays / 7;
+  
+  return diffWeeks <= maxWeeks;
+}
 
 async function sendTelegramMessage(message) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
@@ -44,13 +63,14 @@ async function sendTelegramMessage(message) {
 
 async function run() {
   console.log(`[Monitor] Starting execution at ${new Date().toISOString()}`);
+  console.log(`[Monitor] Headless mode: ${HEADLESS}`);
   
   if (!USERNAME || !PASSWORD) {
     console.error('[Monitor] Error: USERNAME and PASSWORD must be set in the environment or .env file.');
     process.exit(1);
   }
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({ headless: HEADLESS });
   const page = await browser.newPage();
 
   try {
@@ -69,7 +89,6 @@ async function run() {
     console.log('[Monitor] Submitting credentials...');
     await page.click('#ctl00_cphMaster_btnPopupLoginCitizenLogin');
 
-    // Wait for the login request to process
     await page.waitForTimeout(5000);
     console.log('[Monitor] URL after login attempt:', page.url());
 
@@ -99,12 +118,10 @@ async function run() {
       console.log(`\n[Monitor] Checking doctor: ${doc.name} (ID: ${doc.id})`);
 
       if (d > 0) {
-        // Re-open doctor selection popup
         await page.click('#ctl00_cphMaster_hlAppmtList');
         await page.waitForSelector('#selPopupAppMt', { state: 'visible', timeout: 5000 });
       }
 
-      // Record old doctor text to verify updates
       let oldDocLabel = '';
       if (await page.isVisible('#ctl00_cphMaster_labAppmt')) {
         oldDocLabel = await page.innerText('#ctl00_cphMaster_labAppmt');
@@ -113,7 +130,6 @@ async function run() {
       await page.selectOption('#selPopupAppMt', doc.id);
       await page.click('#btnPopupAppMtOk');
 
-      // Wait for AJAX update containing the doctor name
       await page.waitForFunction(
         ({ docName, oldDoc }) => {
           const el = document.getElementById('ctl00_cphMaster_labAppmt');
@@ -125,45 +141,82 @@ async function run() {
         { timeout: 10000 }
       );
 
-      console.log(`[Monitor] Calendar loaded for ${doc.name}. Scanning ${MAX_WEEKS} weeks...`);
+      console.log(`[Monitor] Calendar loaded for ${doc.name}. Scanning for free slots...`);
 
-      for (let week = 1; week <= MAX_WEEKS; week++) {
+      let currentFirstDateStr = '';
+      let step = 0;
+
+      while (true) {
+        step++;
         const gvxExists = await page.isVisible('#ctl00_cphMaster_gvx');
+        let weekDate = null;
 
         if (gvxExists) {
-          // Parse current week dates
-          const currentFirstDate = await page.evaluate(() => {
+          currentFirstDateStr = await page.evaluate(() => {
             const td = document.querySelector('#ctl00_cphMaster_gvx tr:first-child td:nth-child(2)');
             return td ? td.innerText.trim().replace(/\n/g, ' ') : '';
           });
+          
+          weekDate = parseDateFromString(currentFirstDateStr);
+          console.log(`[Monitor] Step ${step} - Week starting: ${currentFirstDateStr}`);
+
+          if (weekDate && !isWithinWeeks(weekDate, MAX_WEEKS)) {
+            console.log(`[Monitor] Week starting ${currentFirstDateStr} is beyond MAX_WEEKS (${MAX_WEEKS}). Stopping search for this doctor.`);
+            break;
+          }
 
           const slots = await parseCalendarPage(page);
-          console.log(`  - Week ${week} (${currentFirstDate}): Found ${slots.length} free slots.`);
+          console.log(`[Monitor] Found ${slots.length} free slots this week.`);
           
           if (slots.length > 0) {
             slots.forEach(slot => {
               allFoundSlots.push({
                 doctor: doc.name,
-                weekNum: week,
-                weekStart: currentFirstDate,
+                weekStart: currentFirstDateStr,
                 ...slot
               });
             });
           }
         } else {
-          console.log(`  - Week ${week}: No calendar table (gvx) available (no hours scheduled).`);
+          console.log(`[Monitor] Step ${step} - No calendar table (gvx) rendered. (No office hours scheduled this week)`);
         }
 
-        // Navigate to the next week if not on the last requested week
-        if (week < MAX_WEEKS) {
-          const responsePromise = page.waitForResponse(
-            response => response.url().includes('Appointment.aspx') && response.status() === 200,
-            { timeout: 10000 }
-          );
+        console.log('[Monitor] Clicking "Next Free" button to search further...');
+        const responsePromise = page.waitForResponse(
+          response => response.url().includes('Appointment.aspx') && response.status() === 200,
+          { timeout: 5000 }
+        ).catch(() => null);
 
-          await page.click('#ctl00_cphMaster_lbNext');
-          await responsePromise;
-          await page.waitForTimeout(1000); // Small DOM settling buffer
+        await page.click('#ctl00_cphMaster_lbNextFree');
+        const res = await responsePromise;
+        if (!res) {
+          console.log('[Monitor] AJAX request timed out. No action occurred. Stopping search.');
+          break;
+        }
+        await page.waitForTimeout(1000); // Allow DOM to settle
+
+        // Check if the warning popup appeared (indicates no more free appointments)
+        const isPopupVisible = await page.isVisible('#ctl00_cphMaster_PopMsg_tabPopupMsg');
+        if (isPopupVisible) {
+          const popupText = await page.innerText('#ctl00_cphMaster_PopMsg_labPopupMsgText');
+          console.log(`[Monitor] Warning popup visible: "${popupText.trim()}"`);
+          
+          console.log('[Monitor] Closing warning popup...');
+          await page.click('#ctl00_cphMaster_PopMsg_btnPopupMsgOk');
+          await page.waitForSelector('#ctl00_cphMaster_PopMsg_tabPopupMsg', { state: 'hidden', timeout: 5000 });
+          console.log('[Monitor] Popup closed. No more free appointments for this doctor.');
+          break;
+        }
+
+        // Compare week start dates to prevent infinite loops if page doesn't change
+        const newFirstDateStr = await page.evaluate(() => {
+          const td = document.querySelector('#ctl00_cphMaster_gvx tr:first-child td:nth-child(2)');
+          return td ? td.innerText.trim().replace(/\n/g, ' ') : '';
+        });
+
+        if (newFirstDateStr === currentFirstDateStr) {
+          console.log('[Monitor] Week starting date did not change. Stopping search.');
+          break;
         }
       }
     }
@@ -225,15 +278,12 @@ async function parseCalendarPage(page) {
 
       for (let j = 1; j < cells.length - 1; j++) {
         const cell = cells[j];
-        const span = cell.querySelector('span');
-        if (span) {
-          const className = span.className || '';
-          if (className.includes('gvAppCel0') && !className.includes('gvAppCel0Past')) {
-            slots.push({
-              day: headers[j],
-              time: time,
-            });
-          }
+        const link = cell.querySelector('a.freeApp');
+        if (link) {
+          slots.push({
+            day: headers[j],
+            time: time,
+          });
         }
       }
     }
