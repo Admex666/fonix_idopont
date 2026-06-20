@@ -29,6 +29,19 @@ function isWithinWeeks(date, maxWeeks) {
   return diffWeeks <= maxWeeks;
 }
 
+function getSlotDate(slot) {
+  const dateMatch = slot.day.match(/(\d{4})\.(\d{2})\.(\d{2})/);
+  const timeMatch = slot.time.match(/(\d{2}):(\d{2})/);
+  if (!dateMatch || !timeMatch) return new Date(0);
+  return new Date(
+    parseInt(dateMatch[1], 10),
+    parseInt(dateMatch[2], 10) - 1,
+    parseInt(dateMatch[3], 10),
+    parseInt(timeMatch[1], 10),
+    parseInt(timeMatch[2], 10)
+  );
+}
+
 async function sendTelegramMessage(message) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     console.log('[Telegram] Credentials not configured. Skipping notification.');
@@ -225,8 +238,10 @@ async function run() {
 
     if (allFoundSlots.length > 0) {
       console.log('[Monitor] Free slots found! Preparing Telegram notification...');
+      console.log(`[Monitor] Limiting notification to the 3 earliest slots per doctor.`);
+
       let message = `🚨 <b>FŐNIXWEB SZABAD IDŐPONT!</b> 🚨\n\n`;
-      message += `Az alábbi szabad időpontokat találtam az elkövetkező ${MAX_WEEKS} hétben:\n\n`;
+      message += `A 3-3 legkorábbi szabad időpont az elkövetkező ${MAX_WEEKS} hétben:\n\n`;
 
       // Group by doctor
       const groupedByDoc = {};
@@ -238,8 +253,12 @@ async function run() {
       });
 
       for (const [docName, slots] of Object.entries(groupedByDoc)) {
+        // Sort chronologically for this doctor
+        slots.sort((a, b) => getSlotDate(a) - getSlotDate(b));
+        const earliestSlots = slots.slice(0, 3);
+
         message += `👨‍⚕️ <b>${docName}</b>:\n`;
-        slots.forEach(slot => {
+        earliestSlots.forEach(slot => {
           message += `• 📅 <code>${slot.day} ${slot.time}</code>\n`;
         });
         message += `\n`;
