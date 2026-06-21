@@ -234,18 +234,40 @@ async function run() {
       }
     }
 
-    console.log(`\n[Monitor] Scan finished. Total free slots found: ${allFoundSlots.length}`);
+    let filteredSlots = allFoundSlots;
+    const currentAppDateStr = process.env.CURRENT_APPOINTMENT_DATE;
+    let currentAppDate = null;
 
-    if (allFoundSlots.length > 0) {
-      console.log('[Monitor] Free slots found! Preparing Telegram notification...');
+    if (currentAppDateStr) {
+      currentAppDate = parseDateFromString(currentAppDateStr);
+      if (currentAppDate) {
+        currentAppDate.setHours(0, 0, 0, 0);
+        console.log(`[Monitor] Filtering for slots strictly before current appointment date: ${currentAppDateStr}`);
+        filteredSlots = allFoundSlots.filter(slot => {
+          const slotDate = getSlotDate(slot);
+          return slotDate < currentAppDate;
+        });
+      }
+    }
+
+    console.log(`\n[Monitor] Scan finished. Total free slots found: ${allFoundSlots.length}. Eligible slots: ${filteredSlots.length}`);
+
+    if (filteredSlots.length > 0) {
+      console.log('[Monitor] Eligible free slots found! Preparing Telegram notification...');
       console.log(`[Monitor] Limiting notification to the 3 earliest slots per doctor.`);
 
-      let message = `🚨 <b>FŐNIXWEB SZABAD IDŐPONT!</b> 🚨\n\n`;
-      message += `A 3-3 legkorábbi szabad időpont az elkövetkező ${MAX_WEEKS} hétben:\n\n`;
+      let message = '';
+      if (currentAppDateStr) {
+        message = `🚨 <b>FŐNIXWEB: KORÁBBI IDŐPONT TALÁLHATÓ!</b> 🚨\n\n`;
+        message += `Találtam a jelenlegi időpontodnál (<code>${currentAppDateStr}</code>) korábbi időpontot az elkövetkező ${MAX_WEEKS} hétben:\n\n`;
+      } else {
+        message = `🚨 <b>FŐNIXWEB SZABAD IDŐPONT!</b> 🚨\n\n`;
+        message += `A 3-3 legkorábbi szabad időpont az elkövetkező ${MAX_WEEKS} hétben:\n\n`;
+      }
 
       // Group by doctor
       const groupedByDoc = {};
-      allFoundSlots.forEach(slot => {
+      filteredSlots.forEach(slot => {
         if (!groupedByDoc[slot.doctor]) {
           groupedByDoc[slot.doctor] = [];
         }

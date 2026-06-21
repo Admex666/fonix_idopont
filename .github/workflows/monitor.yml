@@ -33,4 +33,5 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MAX_WEEKS: ${{ secrets.MAX_WEEKS || '4' }}
+          CURRENT_APPOINTMENT_DATE: ${{ secrets.CURRENT_APPOINTMENT_DATE }}
         run: node monitor.js
