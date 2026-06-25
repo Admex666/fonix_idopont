@@ -24,7 +24,7 @@ jobs:
         run: npm ci
 
       - name: Install Playwright Chromium Browser
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install chromium
 
       - name: Run Appointment Monitor
         env:
