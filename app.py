@@ -166,23 +166,30 @@ def get_monitors():
 def save_monitor(data, monitor_id=None):
     try:
         if monitor_id:
-            # Update
             res = requests.patch(f"{url_monitors}?id=eq.{monitor_id}", headers=headers, json=data)
         else:
-            # Create
             res = requests.post(url_monitors, headers=headers, json=data)
-        return res.status_code in [200, 201, 204]
+        
+        if res.status_code in [200, 201, 204]:
+            return True
+        else:
+            st.error(f"Supabase mentési hiba (Státusz: {res.status_code}): {res.text}")
+            return False
     except Exception as e:
-        st.error(f"Hiba a mentésnél: {str(e)}")
+        st.error(f"Hálózati hiba a mentésnél: {str(e)}")
         return False
 
 # Delete configuration
 def delete_monitor(monitor_id):
     try:
         res = requests.delete(f"{url_monitors}?id=eq.{monitor_id}", headers=headers)
-        return res.status_code in [200, 204]
+        if res.status_code in [200, 204]:
+            return True
+        else:
+            st.error(f"Supabase törlési hiba (Státusz: {res.status_code}): {res.text}")
+            return False
     except Exception as e:
-        st.error(f"Hiba a törlésnél: {str(e)}")
+        st.error(f"Hálózati hiba a törlésnél: {str(e)}")
         return False
 
 monitors = get_monitors()
@@ -196,39 +203,113 @@ with tab_list:
     else:
         for m in monitors:
             status_color = "🟢 Aktív" if m["is_active"] else "🔴 Kikapcsolva"
+            is_editing = st.session_state.get("editing_id") == m["id"]
             
-            with st.expander(f"👤 {m['name']} ({status_color})"):
-                col1, col2 = st.columns([2, 1])
-                
-                with col1:
-                    st.write(f"**Figyelt hetek:** {m['max_weeks']} hét")
-                    if m["current_appointment_date"]:
-                        st.write(f"**Aktuális lefoglalt dátum:** `{m['current_appointment_date']}` (Csak ennél korábbiakat keres!)")
+            with st.expander(f"👤 {m['name']} ({status_color})", expanded=is_editing):
+                if is_editing:
+                    st.write("### Profil Szerkesztése")
+                    edit_name = st.text_input("Profil Neve", value=m["name"], key=f"edit_name_{m['id']}")
+                    
+                    edit_selected_docs = st.multiselect(
+                        "Figyelendő orvosok/szakrendelések",
+                        options=list(DOCTORS.keys()),
+                        format_func=lambda x: DOCTORS[x],
+                        default=m["doctor_ids"],
+                        key=f"edit_docs_{m['id']}"
+                    )
+                    
+                    col_weeks, col_date = st.columns(2)
+                    with col_weeks:
+                        edit_max_w = st.number_input("Hány hetet vizsgáljon?", min_value=1, max_value=24, value=int(m["max_weeks"]), key=f"edit_weeks_{m['id']}")
+                    with col_date:
+                        import datetime
+                        default_date = None
+                        if m["current_appointment_date"]:
+                            try:
+                                default_date = datetime.date.fromisoformat(m["current_appointment_date"])
+                            except:
+                                default_date = None
+                        edit_curr_date = st.date_input("Meglévő időpont dátuma (Opcionális)", value=default_date, key=f"edit_date_{m['id']}")
+                        
+                    edit_channel = st.selectbox("Értesítési csatorna", ["telegram", "pushbullet"], index=0 if m["notification_channel"] == "telegram" else 1, key=f"edit_channel_{m['id']}")
+                    
+                    edit_tg_bot = m["telegram_bot_token"] or ""
+                    edit_tg_chat = m["telegram_chat_id"] or ""
+                    edit_pb = m["pushbullet_token"] or ""
+                    
+                    if edit_channel == "telegram":
+                        col_t1, col_t2 = st.columns(2)
+                        with col_t1:
+                            edit_tg_bot = st.text_input("Telegram Bot Token", value=edit_tg_bot, type="password", key=f"edit_tg_bot_{m['id']}")
+                        with col_t2:
+                            edit_tg_chat = st.text_input("Telegram Chat ID", value=edit_tg_chat, key=f"edit_tg_chat_{m['id']}")
                     else:
-                        st.write("**Aktuális lefoglalt dátum:** Nincs beállítva (bármilyen időpont jó)")
+                        edit_pb = st.text_input("Pushbullet Access Token", value=edit_pb, type="password", key=f"edit_pb_{m['id']}")
                         
-                    doc_names = [DOCTORS.get(d_id, f"Ismeretlen orvos #{d_id}") for d_id in m["doctor_ids"]]
-                    st.write("**Figyelt szakrendelések / orvosok:**")
-                    for d_name in doc_names:
-                        st.write(f"- {d_name}")
-                        
-                    st.write(f"**Értesítési csatorna:** {m['notification_channel'].capitalize()}")
-                
-                with col2:
-                    st.write("### Műveletek")
-                    # Toggle status
-                    new_status = not m["is_active"]
-                    toggle_btn = "Kikapcsolás" if m["is_active"] else "Bekapcsolás"
-                    if st.button(toggle_btn, key=f"toggle_{m['id']}"):
-                        if save_monitor({"is_active": new_status}, m["id"]):
-                            st.success("Státusz frissítve!")
+                    col_btn1, col_btn2 = st.columns(2)
+                    with col_btn1:
+                        if st.button("💾 Mentés", key=f"save_btn_{m['id']}"):
+                            if not edit_name or not edit_selected_docs:
+                                st.error("Kérlek töltsd ki a Profil nevét és válassz orvost!")
+                            else:
+                                updated_data = {
+                                    "name": edit_name,
+                                    "fonix_username": "shared",
+                                    "fonix_password": "shared",
+                                    "doctor_ids": edit_selected_docs,
+                                    "max_weeks": int(edit_max_w),
+                                    "current_appointment_date": str(edit_curr_date) if edit_curr_date else None,
+                                    "notification_channel": edit_channel,
+                                    "telegram_bot_token": edit_tg_bot if edit_channel == "telegram" else None,
+                                    "telegram_chat_id": edit_tg_chat if edit_channel == "telegram" else None,
+                                    "pushbullet_token": edit_pb if edit_channel == "pushbullet" else None,
+                                    "is_active": m["is_active"]
+                                }
+                                if save_monitor(updated_data, m["id"]):
+                                    st.success("Módosítások mentve!")
+                                    st.session_state["editing_id"] = None
+                                    st.rerun()
+                    with col_btn2:
+                        if st.button("❌ Mégsem", key=f"cancel_btn_{m['id']}"):
+                            st.session_state["editing_id"] = None
                             st.rerun()
+                else:
+                    col1, col2 = st.columns([2, 1])
+                    
+                    with col1:
+                        st.write(f"**Figyelt hetek:** {m['max_weeks']} hét")
+                        if m["current_appointment_date"]:
+                            st.write(f"**Aktuális lefoglalt dátum:** `{m['current_appointment_date']}` (Csak ennél korábbiakat keres!)")
+                        else:
+                            st.write("**Aktuális lefoglalt dátum:** Nincs beállítva (bármilyen időpont jó)")
                             
-                    # Delete
-                    if st.button("🗑️ Törlés", key=f"del_{m['id']}"):
-                        if delete_monitor(m["id"]):
-                            st.success("Figyelő törölve!")
+                        doc_names = [DOCTORS.get(d_id, f"Ismeretlen orvos #{d_id}") for d_id in m["doctor_ids"]]
+                        st.write("**Figyelt szakrendelések / orvosok:**")
+                        for d_name in doc_names:
+                            st.write(f"- {d_name}")
+                            
+                        st.write(f"**Értesítési csatorna:** {m['notification_channel'].capitalize()}")
+                    
+                    with col2:
+                        st.write("### Műveletek")
+                        # Toggle status
+                        new_status = not m["is_active"]
+                        toggle_btn = "Kikapcsolás" if m["is_active"] else "Bekapcsolás"
+                        if st.button(toggle_btn, key=f"toggle_{m['id']}"):
+                            if save_monitor({"is_active": new_status}, m["id"]):
+                                st.success("Státusz frissítve!")
+                                st.rerun()
+                                
+                        # Edit Trigger
+                        if st.button("✏️ Szerkesztés", key=f"edit_trigger_{m['id']}"):
+                            st.session_state["editing_id"] = m["id"]
                             st.rerun()
+                                
+                        # Delete
+                        if st.button("🗑️ Törlés", key=f"del_{m['id']}"):
+                            if delete_monitor(m["id"]):
+                                st.success("Figyelő törölve!")
+                                st.rerun()
 
 with tab_add:
     st.subheader("Új időpontfigyelő profil konfigurálása")
