@@ -28,10 +28,7 @@ jobs:
 
       - name: Run Appointment Monitor
         env:
-          USERNAME: ${{ secrets.FONIX_USERNAME }}
-          PASSWORD: ${{ secrets.FONIX_PASSWORD }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           MAX_WEEKS: ${{ secrets.MAX_WEEKS || '4' }}
-          CURRENT_APPOINTMENT_DATE: ${{ secrets.CURRENT_APPOINTMENT_DATE }}
         run: node monitor.js

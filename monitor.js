@@ -1,15 +1,16 @@
 const { chromium } = require('playwright');
+const { createClient } = require('@supabase/supabase-js');
 const path = require('path');
 
-// Support loading .env locally, but allow environment variables on cloud environments (e.g. GitHub Actions)
+// Support loading .env locally
 require('dotenv').config({ path: path.join(__dirname, '.env'), override: true });
 
 const USERNAME = process.env.USERNAME;
 const PASSWORD = process.env.PASSWORD;
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const MAX_WEEKS = parseInt(process.env.MAX_WEEKS || '4', 10);
-const HEADLESS = process.env.HEADLESS !== 'false'; // Default to headless, but allow local headful debugging
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const GLOBAL_MAX_WEEKS = parseInt(process.env.MAX_WEEKS || '4', 10);
+const HEADLESS = process.env.HEADLESS !== 'false';
 
 function parseDateFromString(str) {
   const match = str.match(/(\d{4})\.(\d{2})\.(\d{2})/);
@@ -42,13 +43,13 @@ function getSlotDate(slot) {
   );
 }
 
-async function sendTelegramMessage(message) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+async function sendTelegramMessage(token, chatId, message) {
+  if (!token || !chatId) {
     console.log('[Telegram] Credentials not configured. Skipping notification.');
     return;
   }
 
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const url = `https://api.telegram.org/bot${token}/sendMessage`;
   try {
     const response = await fetch(url, {
       method: 'POST',
@@ -56,7 +57,7 @@ async function sendTelegramMessage(message) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
+        chat_id: chatId,
         text: message,
         parse_mode: 'HTML',
         disable_web_page_preview: true,
@@ -67,26 +68,93 @@ async function sendTelegramMessage(message) {
     if (!data.ok) {
       console.error('[Telegram] Failed to send message:', data);
     } else {
-      console.log('[Telegram] Notification sent successfully.');
+      console.log('[Telegram] Telegram notification sent successfully.');
     }
   } catch (error) {
     console.error('[Telegram] Error sending message:', error);
   }
 }
 
+async function sendPushbulletMessage(token, title, body) {
+  if (!token) {
+    console.log('[Pushbullet] Token not configured. Skipping notification.');
+    return;
+  }
+
+  const url = 'https://api.pushbullet.com/v2/pushes';
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Access-Token': token,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        type: 'note',
+        title: title,
+        body: body,
+      }),
+    });
+
+    const data = await response.json();
+    if (response.status !== 200) {
+      console.error('[Pushbullet] Failed to send message:', data);
+    } else {
+      console.log('[Pushbullet] Pushbullet notification sent successfully.');
+    }
+  } catch (error) {
+    console.error('[Pushbullet] Error sending message:', error);
+  }
+}
+
 async function run() {
   console.log(`[Monitor] Starting execution at ${new Date().toISOString()}`);
   console.log(`[Monitor] Headless mode: ${HEADLESS}`);
-  
+
+  if (!SUPABASE_URL || !SUPABASE_KEY) {
+    console.error('[Monitor] Error: SUPABASE_URL and SUPABASE_KEY must be set.');
+    process.exit(1);
+  }
+
   if (!USERNAME || !PASSWORD) {
     console.error('[Monitor] Error: USERNAME and PASSWORD must be set in the environment or .env file.');
     process.exit(1);
   }
 
+  const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+  console.log('[Monitor] Fetching active configurations from Supabase...');
+  const { data: monitors, error } = await supabase
+    .from('monitors')
+    .select('*')
+    .eq('is_active', true);
+
+  if (error) {
+    console.error('[Monitor] Failed to fetch monitors from Supabase:', error);
+    process.exit(1);
+  }
+
+  console.log(`[Monitor] Found ${monitors.length} active configurations.`);
+  if (monitors.length === 0) {
+    console.log('[Monitor] No active monitors found. Exiting.');
+    return;
+  }
+
+  // Find the set of all unique doctor IDs across all monitors
+  const uniqueDocIds = [...new Set(monitors.flatMap(m => m.doctor_ids || []))];
+  console.log(`[Monitor] Unique Doctor IDs to scan: ${uniqueDocIds.join(', ')}`);
+
   const browser = await chromium.launch({ headless: HEADLESS });
   const page = await browser.newPage();
+  
+  // Accumulated results: mapping monitor.id -> array of eligible slots
+  const monitorResults = {};
+  monitors.forEach(m => {
+    monitorResults[m.id] = [];
+  });
 
   try {
+    // 1. Log in once
     console.log('[Monitor] Navigating to FonixWeb homepage...');
     await page.goto('https://fonixweb.szakrendelo16.hu/FonixWeb/Default.aspx');
     await page.waitForLoadState('networkidle');
@@ -108,56 +176,68 @@ async function run() {
     console.log('[Monitor] Navigating to Appointment page...');
     await page.goto('https://fonixweb.szakrendelo16.hu/FonixWeb/Member/Appointment.aspx');
     await page.waitForLoadState('networkidle');
-    
+
     const currentUrl = page.url();
     if (currentUrl.includes('Default.aspx?ReturnUrl=')) {
-      console.error('[Monitor] Login failed. Redirected back to login page.');
-      await sendTelegramMessage('⚠️ <b>FőnixWeb Hiba:</b> A bejelentkezés sikertelen volt! Kérlek ellenőrizd a felhasználónevedet és a jelszavadat.');
+      console.error('[Monitor] Login failed. Incorrect global credentials in .env.');
+      await browser.close();
       process.exit(1);
     }
 
     console.log('[Monitor] Waiting for doctor selection popup...');
     await page.waitForSelector('#selPopupAppMt', { state: 'visible', timeout: 10000 });
 
-    const doctors = [
-      { id: '2880574', name: 'Abonyi Bence' },
-      { id: '2880658', name: 'Pánti Zsombor Alpár' }
-    ];
+    // 2. Iterate over unique doctors
+    for (let d = 0; d < uniqueDocIds.length; d++) {
+      const docId = uniqueDocIds[d];
 
-    const allFoundSlots = [];
+      // Find monitors interested in this doctor
+      const docMonitors = monitors.filter(m => (m.doctor_ids || []).includes(docId));
+      if (docMonitors.length === 0) continue;
 
-    for (let d = 0; d < doctors.length; d++) {
-      const doc = doctors[d];
-      console.log(`\n[Monitor] Checking doctor: ${doc.name} (ID: ${doc.id})`);
+      // Find largest max_weeks requested for this doctor
+      const docMaxWeeks = Math.max(...docMonitors.map(m => m.max_weeks || GLOBAL_MAX_WEEKS));
 
       if (d > 0) {
         await page.click('#ctl00_cphMaster_hlAppmtList');
         await page.waitForSelector('#selPopupAppMt', { state: 'visible', timeout: 5000 });
       }
 
+      // Fetch the actual doctor name from the select options
+      const docName = await page.evaluate((id) => {
+        const option = document.querySelector(`#selPopupAppMt option[value="${id}"]`);
+        return option ? option.text.trim() : '';
+      }, docId);
+
+      if (!docName) {
+        console.log(`[Monitor] Doctor ID ${docId} not found in dropdown options. Skipping.`);
+        continue;
+      }
+
+      console.log(`\n[Monitor] --- Scanning Doctor: ${docName} (ID: ${docId}) up to ${docMaxWeeks} weeks ---`);
+
       let oldDocLabel = '';
       if (await page.isVisible('#ctl00_cphMaster_labAppmt')) {
         oldDocLabel = await page.innerText('#ctl00_cphMaster_labAppmt');
       }
 
-      await page.selectOption('#selPopupAppMt', doc.id);
+      await page.selectOption('#selPopupAppMt', docId);
       await page.click('#btnPopupAppMtOk');
 
       await page.waitForFunction(
-        ({ docName, oldDoc }) => {
+        ({ expectedName, oldDoc }) => {
           const el = document.getElementById('ctl00_cphMaster_labAppmt');
           if (!el) return false;
           const text = el.innerText || '';
-          return text.includes(docName) && text !== oldDoc;
+          return text.includes(expectedName) && text !== oldDoc;
         },
-        { docName: doc.name, oldDoc: oldDocLabel },
+        { expectedName: docName, oldDoc: oldDocLabel },
         { timeout: 10000 }
       );
 
-      console.log(`[Monitor] Calendar loaded for ${doc.name}. Scanning for free slots...`);
-
       let currentFirstDateStr = '';
       let step = 0;
+      const docFoundSlots = [];
 
       while (true) {
         step++;
@@ -173,8 +253,8 @@ async function run() {
           weekDate = parseDateFromString(currentFirstDateStr);
           console.log(`[Monitor] Step ${step} - Week starting: ${currentFirstDateStr}`);
 
-          if (weekDate && !isWithinWeeks(weekDate, MAX_WEEKS)) {
-            console.log(`[Monitor] Week starting ${currentFirstDateStr} is beyond MAX_WEEKS (${MAX_WEEKS}). Stopping search for this doctor.`);
+          if (weekDate && !isWithinWeeks(weekDate, docMaxWeeks)) {
+            console.log(`[Monitor] Week starting ${currentFirstDateStr} is beyond max ${docMaxWeeks} weeks. Stopping search for this doctor.`);
             break;
           }
 
@@ -183,8 +263,8 @@ async function run() {
           
           if (slots.length > 0) {
             slots.forEach(slot => {
-              allFoundSlots.push({
-                doctor: doc.name,
+              docFoundSlots.push({
+                doctor: docName,
                 weekStart: currentFirstDateStr,
                 ...slot
               });
@@ -206,9 +286,9 @@ async function run() {
           console.log('[Monitor] AJAX request timed out. No action occurred. Stopping search.');
           break;
         }
-        await page.waitForTimeout(1000); // Allow DOM to settle
+        await page.waitForTimeout(1000);
 
-        // Check if the warning popup appeared (indicates no more free appointments)
+        // Check if the warning popup appeared
         const isPopupVisible = await page.isVisible('#ctl00_cphMaster_PopMsg_tabPopupMsg');
         if (isPopupVisible) {
           const popupText = await page.innerText('#ctl00_cphMaster_PopMsg_labPopupMsgText');
@@ -221,7 +301,6 @@ async function run() {
           break;
         }
 
-        // Compare week start dates to prevent infinite loops if page doesn't change
         const newFirstDateStr = await page.evaluate(() => {
           const td = document.querySelector('#ctl00_cphMaster_gvx tr:first-child td:nth-child(2)');
           return td ? td.innerText.trim().replace(/\n/g, ' ') : '';
@@ -232,74 +311,100 @@ async function run() {
           break;
         }
       }
-    }
 
-    let filteredSlots = allFoundSlots;
-    const currentAppDateStr = process.env.CURRENT_APPOINTMENT_DATE;
-    let currentAppDate = null;
+      // Distribute eligible slots to matching monitors
+      docMonitors.forEach(m => {
+        const mMaxWeeks = m.max_weeks || GLOBAL_MAX_WEEKS;
+        let mAppDate = null;
+        if (m.current_appointment_date) {
+          mAppDate = new Date(m.current_appointment_date);
+          mAppDate.setHours(0, 0, 0, 0);
+        }
 
-    if (currentAppDateStr) {
-      currentAppDate = parseDateFromString(currentAppDateStr);
-      if (currentAppDate) {
-        currentAppDate.setHours(0, 0, 0, 0);
-        console.log(`[Monitor] Filtering for slots strictly before current appointment date: ${currentAppDateStr}`);
-        filteredSlots = allFoundSlots.filter(slot => {
-          const slotDate = getSlotDate(slot);
-          return slotDate < currentAppDate;
+        const eligibleSlots = docFoundSlots.filter(slot => {
+          // Check week boundary
+          const slotWeekDate = parseDateFromString(slot.weekStart);
+          if (slotWeekDate && !isWithinWeeks(slotWeekDate, mMaxWeeks)) {
+            return false;
+          }
+          // Check appointment date boundary
+          if (mAppDate) {
+            const slotDate = getSlotDate(slot);
+            return slotDate < mAppDate;
+          }
+          return true;
         });
-      }
+
+        monitorResults[m.id].push(...eligibleSlots);
+      });
     }
 
-    console.log(`\n[Monitor] Scan finished. Total free slots found: ${allFoundSlots.length}. Eligible slots: ${filteredSlots.length}`);
+  } catch (err) {
+    console.error('[Monitor] Fatal error during scraping session:', err);
+  } finally {
+    await browser.close();
+    console.log('[Monitor] Browser closed.');
+  }
 
-    if (filteredSlots.length > 0) {
-      console.log('[Monitor] Eligible free slots found! Preparing Telegram notification...');
-      console.log(`[Monitor] Limiting notification to the 3 earliest slots per doctor.`);
+  // 3. Send notifications for each monitor
+  console.log('\n[Monitor] --- Processing and dispatching notifications ---');
+  for (const monitor of monitors) {
+    const slots = monitorResults[monitor.id] || [];
+    console.log(`[Monitor] User ${monitor.name}: Found ${slots.length} eligible slots.`);
 
-      let message = '';
-      if (currentAppDateStr) {
-        message = `🚨 <b>FŐNIXWEB: KORÁBBI IDŐPONT TALÁLHATÓ!</b> 🚨\n\n`;
-        message += `Találtam a jelenlegi időpontodnál (<code>${currentAppDateStr}</code>) korábbi időpontot az elkövetkező ${MAX_WEEKS} hétben:\n\n`;
-      } else {
-        message = `🚨 <b>FŐNIXWEB SZABAD IDŐPONT!</b> 🚨\n\n`;
-        message += `A 3-3 legkorábbi szabad időpont az elkövetkező ${MAX_WEEKS} hétben:\n\n`;
-      }
+    if (slots.length > 0) {
+      console.log(`[Monitor] Sending notification to ${monitor.name} via ${monitor.notification_channel}...`);
+
+      const maxWeeks = monitor.max_weeks || GLOBAL_MAX_WEEKS;
+      const currentAppDateStr = monitor.current_appointment_date;
 
       // Group by doctor
       const groupedByDoc = {};
-      filteredSlots.forEach(slot => {
+      slots.forEach(slot => {
         if (!groupedByDoc[slot.doctor]) {
           groupedByDoc[slot.doctor] = [];
         }
         groupedByDoc[slot.doctor].push(slot);
       });
 
-      for (const [docName, slots] of Object.entries(groupedByDoc)) {
-        // Sort chronologically for this doctor
-        slots.sort((a, b) => getSlotDate(a) - getSlotDate(b));
-        const earliestSlots = slots.slice(0, 3);
+      let textMessage = '';
+      let htmlMessage = '';
 
-        message += `👨‍⚕️ <b>${docName}</b>:\n`;
-        earliestSlots.forEach(slot => {
-          message += `• 📅 <code>${slot.day} ${slot.time}</code>\n`;
-        });
-        message += `\n`;
+      if (currentAppDateStr) {
+        textMessage = `🚨 FŐNIXWEB: KORÁBBI IDŐPONT TALÁLHATÓ! 🚨\n\nTaláltam a jelenlegi időpontodnál (${currentAppDateStr}) korábbi időpontot az elkövetkező ${maxWeeks} hétben:\n\n`;
+        htmlMessage = `🚨 <b>FŐNIXWEB: KORÁBBI IDŐPONT TALÁLHATÓ!</b> 🚨\n\nTaláltam a jelenlegi időpontodnál (<code>${currentAppDateStr}</code>) korábbi időpontot az elkövetkező ${maxWeeks} hétben:\n\n`;
+      } else {
+        textMessage = `🚨 FŐNIXWEB SZABAD IDŐPONT! 🚨\n\nA 3-3 legkorábbi szabad időpont az elkövetkező ${maxWeeks} hétben:\n\n`;
+        htmlMessage = `🚨 <b>FŐNIXWEB SZABAD IDŐPONT!</b> 🚨\n\nA 3-3 legkorábbi szabad időpont az elkövetkező ${maxWeeks} hétben:\n\n`;
       }
 
-      message += `🔗 <a href="https://fonixweb.szakrendelo16.hu/FonixWeb/Default.aspx">Kattints ide a foglaláshoz</a>`;
+      for (const [docName, docSlots] of Object.entries(groupedByDoc)) {
+        docSlots.sort((a, b) => getSlotDate(a) - getSlotDate(b));
+        const earliest = docSlots.slice(0, 3);
 
-      await sendTelegramMessage(message);
-    } else {
-      console.log('[Monitor] No free slots found in the monitored timeframe.');
+        textMessage += `👨‍⚕️ ${docName}:\n`;
+        htmlMessage += `👨‍⚕️ <b>${docName}</b>:\n`;
+
+        earliest.forEach(slot => {
+          textMessage += `• ${slot.day} ${slot.time}\n`;
+          htmlMessage += `• 📅 <code>${slot.day} ${slot.time}</code>\n`;
+        });
+        textMessage += `\n`;
+        htmlMessage += `\n`;
+      }
+
+      textMessage += `Foglalás: https://fonixweb.szakrendelo16.hu/FonixWeb/Default.aspx`;
+      htmlMessage += `🔗 <a href="https://fonixweb.szakrendelo16.hu/FonixWeb/Default.aspx">Kattints ide a foglaláshoz</a>`;
+
+      if (monitor.notification_channel === 'pushbullet') {
+        await sendPushbulletMessage(monitor.pushbullet_token, 'FőnixWeb Szabad Időpont', textMessage);
+      } else {
+        await sendTelegramMessage(monitor.telegram_bot_token, monitor.telegram_chat_id, htmlMessage);
+      }
     }
-
-  } catch (error) {
-    console.error('[Monitor] Scraping failed with error:', error);
-    await sendTelegramMessage(`⚠️ <b>FőnixWeb Hiba:</b> Hiba lépett fel a futás során:\n<code>${error.message}</code>`);
-  } finally {
-    await browser.close();
-    console.log('[Monitor] Browser closed. Run completed.');
   }
+
+  console.log('[Monitor] Run completed.');
 }
 
 async function parseCalendarPage(page) {
