@@ -1,0 +1,3 @@
+setup:
+  - project: fonix-idopont
+    config: dev
