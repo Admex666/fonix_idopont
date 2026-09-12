@@ -124,13 +124,28 @@ async function run() {
   const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
   console.log('[Monitor] Fetching active configurations from Supabase...');
-  const { data: monitors, error } = await supabase
-    .from('monitors')
-    .select('*')
-    .eq('is_active', true);
+  let monitors = null;
+  let error = null;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const res = await supabase
+      .from('monitors')
+      .select('*')
+      .eq('is_active', true);
+    
+    monitors = res.data;
+    error = res.error;
+
+    if (!error) break;
+
+    console.warn(`[Monitor] Supabase attempt ${attempt}/3 failed (${error.message}). Retrying in 10s...`);
+    if (attempt < 3) {
+      await new Promise(resolve => setTimeout(resolve, 10000));
+    }
+  }
 
   if (error) {
-    console.error('[Monitor] Failed to fetch monitors from Supabase:', error);
+    console.error('[Monitor] Failed to fetch monitors from Supabase after 3 attempts:', error);
     process.exit(1);
   }
 
