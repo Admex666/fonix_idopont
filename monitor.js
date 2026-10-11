@@ -169,86 +169,112 @@ async function run() {
   });
 
   try {
-    // 1. Log in once
-    console.log('[Monitor] Navigating to FonixWeb homepage...');
-    await page.goto('https://fonixweb.szakrendelo16.hu/FonixWeb/Default.aspx');
-    await page.waitForLoadState('networkidle');
+    // 1. Log in with retry mechanism (up to 3 attempts)
+    let loginSuccess = false;
+    const maxLoginAttempts = 3;
 
-    console.log('[Monitor] Clicking login button...');
-    await page.click('div.BigMenuCitizen');
-    await page.waitForSelector('#ctl00_cphMaster_txtPopupLoginName_Txt', { state: 'visible', timeout: 5000 });
+    for (let attempt = 1; attempt <= maxLoginAttempts; attempt++) {
+      console.log(`[Monitor] Login attempt ${attempt}/${maxLoginAttempts}...`);
+      try {
+        console.log('[Monitor] Navigating to FonixWeb homepage...');
+        await page.goto('https://fonixweb.szakrendelo16.hu/FonixWeb/Default.aspx', { timeout: 30000 });
+        await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
 
-    console.log('[Monitor] Filling in login details...');
-    await page.fill('#ctl00_cphMaster_txtPopupLoginName_Txt', USERNAME);
-    await page.fill('#ctl00_cphMaster_txtPopupLoginPwd_Txt', PASSWORD);
+        console.log('[Monitor] Clicking login button...');
+        await page.click('div.BigMenuCitizen', { timeout: 10000 });
+        await page.waitForSelector('#ctl00_cphMaster_txtPopupLoginName_Txt', { state: 'visible', timeout: 10000 });
 
-    console.log('[Monitor] Submitting credentials...');
-    await page.click('#ctl00_cphMaster_btnPopupLoginCitizenLogin');
+        console.log('[Monitor] Filling in login details...');
+        await page.fill('#ctl00_cphMaster_txtPopupLoginName_Txt', USERNAME);
+        await page.fill('#ctl00_cphMaster_txtPopupLoginPwd_Txt', PASSWORD);
 
-    await page.waitForTimeout(5000);
-    console.log('[Monitor] URL after login attempt:', page.url());
+        console.log('[Monitor] Submitting credentials...');
+        await Promise.all([
+          page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {}),
+          page.click('#ctl00_cphMaster_btnPopupLoginCitizenLogin')
+        ]);
 
-    console.log('[Monitor] Navigating to Appointment page...');
-    await page.goto('https://fonixweb.szakrendelo16.hu/FonixWeb/Member/Appointment.aspx');
-    await page.waitForLoadState('networkidle');
+        await page.waitForTimeout(3000);
+        console.log('[Monitor] URL after login attempt:', page.url());
 
-    const currentUrl = page.url();
-    if (currentUrl.includes('Default.aspx?ReturnUrl=')) {
-      console.error('[Monitor] Login failed. Incorrect global credentials in .env.');
+        console.log('[Monitor] Navigating to Appointment page...');
+        await page.goto('https://fonixweb.szakrendelo16.hu/FonixWeb/Member/Appointment.aspx', { timeout: 30000 });
+        await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+
+        const currentUrl = page.url();
+        if (currentUrl.includes('Default.aspx?ReturnUrl=')) {
+          console.warn(`[Monitor] Login attempt ${attempt} failed: redirected to login URL (${currentUrl}).`);
+        } else {
+          console.log('[Monitor] Waiting for doctor selection popup...');
+          await page.waitForSelector('#selPopupAppMt', { state: 'visible', timeout: 15000 });
+          loginSuccess = true;
+          console.log('[Monitor] Login successful!');
+          break;
+        }
+      } catch (loginErr) {
+        console.warn(`[Monitor] Error during login attempt ${attempt}:`, loginErr.message);
+      }
+
+      if (attempt < maxLoginAttempts) {
+        console.log('[Monitor] Waiting 5 seconds before retrying login...');
+        await page.waitForTimeout(5000);
+      }
+    }
+
+    if (!loginSuccess) {
+      console.error('[Monitor] All login attempts failed. Unable to access Appointment page.');
       await browser.close();
       process.exit(1);
     }
-
-    console.log('[Monitor] Waiting for doctor selection popup...');
-    await page.waitForSelector('#selPopupAppMt', { state: 'visible', timeout: 10000 });
 
     // 2. Iterate over unique doctors
     for (let d = 0; d < uniqueDocIds.length; d++) {
       const docId = uniqueDocIds[d];
 
-      // Find monitors interested in this doctor
-      const docMonitors = monitors.filter(m => (m.doctor_ids || []).includes(docId));
-      if (docMonitors.length === 0) continue;
+      try {
+        // Find monitors interested in this doctor
+        const docMonitors = monitors.filter(m => (m.doctor_ids || []).includes(docId));
+        if (docMonitors.length === 0) continue;
 
-      // Find largest max_weeks requested for this doctor
-      const docMaxWeeks = Math.max(...docMonitors.map(m => m.max_weeks || GLOBAL_MAX_WEEKS));
+        // Find largest max_weeks requested for this doctor
+        const docMaxWeeks = Math.max(...docMonitors.map(m => m.max_weeks || GLOBAL_MAX_WEEKS));
 
-      if (d > 0) {
-        await page.click('#ctl00_cphMaster_hlAppmtList');
-        await page.waitForSelector('#selPopupAppMt', { state: 'visible', timeout: 5000 });
-      }
+        if (d > 0) {
+          await page.click('#ctl00_cphMaster_hlAppmtList');
+          await page.waitForSelector('#selPopupAppMt', { state: 'visible', timeout: 10000 });
+        }
 
-      // Fetch the actual doctor name from the select options
-      const docName = await page.evaluate((id) => {
-        const option = document.querySelector(`#selPopupAppMt option[value="${id}"]`);
-        return option ? option.text.trim() : '';
-      }, docId);
+        // Fetch the actual doctor name from the select options
+        const docName = await page.evaluate((id) => {
+          const option = document.querySelector(`#selPopupAppMt option[value="${id}"]`);
+          return option ? option.text.trim() : '';
+        }, docId);
 
-      if (!docName) {
-        console.log(`[Monitor] Doctor ID ${docId} not found in dropdown options. Skipping.`);
-        continue;
-      }
+        if (!docName) {
+          console.log(`[Monitor] Doctor ID ${docId} not found in dropdown options. Skipping.`);
+          continue;
+        }
 
-      console.log(`\n[Monitor] --- Scanning Doctor: ${docName} (ID: ${docId}) up to ${docMaxWeeks} weeks ---`);
+        console.log(`\n[Monitor] --- Scanning Doctor: ${docName} (ID: ${docId}) up to ${docMaxWeeks} weeks ---`);
 
-      let oldDocLabel = '';
-      if (await page.isVisible('#ctl00_cphMaster_labAppmt')) {
-        oldDocLabel = await page.innerText('#ctl00_cphMaster_labAppmt');
-      }
+        let oldDocLabel = '';
+        if (await page.isVisible('#ctl00_cphMaster_labAppmt')) {
+          oldDocLabel = await page.innerText('#ctl00_cphMaster_labAppmt');
+        }
 
-      await page.selectOption('#selPopupAppMt', docId);
-      await page.click('#btnPopupAppMtOk');
+        await page.selectOption('#selPopupAppMt', docId);
+        await page.click('#btnPopupAppMtOk');
 
-      await page.waitForFunction(
-        ({ expectedName, oldDoc }) => {
-          const el = document.getElementById('ctl00_cphMaster_labAppmt');
-          if (!el) return false;
-          const text = el.innerText || '';
-          return text.includes(expectedName) && text !== oldDoc;
-        },
-        { expectedName: docName, oldDoc: oldDocLabel },
-        { timeout: 10000 }
-      );
+        await page.waitForFunction(
+          ({ expectedName, oldDoc }) => {
+            const el = document.getElementById('ctl00_cphMaster_labAppmt');
+            if (!el) return false;
+            const text = el.innerText || '';
+            return text.includes(expectedName) && text !== oldDoc;
+          },
+          { expectedName: docName, oldDoc: oldDocLabel },
+          { timeout: 10000 }
+        );
 
       let currentFirstDateStr = '';
       let step = 0;
@@ -352,7 +378,10 @@ async function run() {
 
         monitorResults[m.id].push(...eligibleSlots);
       });
+    } catch (docErr) {
+      console.error(`[Monitor] Error scanning doctor ID ${docId}:`, docErr.message);
     }
+  }
 
   } catch (err) {
     console.error('[Monitor] Fatal error during scraping session:', err);
