@@ -160,7 +160,8 @@ async function run() {
   console.log(`[Monitor] Unique Doctor IDs to scan: ${uniqueDocIds.join(', ')}`);
 
   const browser = await chromium.launch({ headless: HEADLESS });
-  const page = await browser.newPage();
+  let activeContext = null;
+  let page = null;
   
   // Accumulated results: mapping monitor.id -> array of eligible slots
   const monitorResults = {};
@@ -169,62 +170,88 @@ async function run() {
   });
 
   try {
-    // 1. Log in with retry mechanism (up to 3 attempts)
-    let loginSuccess = false;
+    // 1. Log in with retry mechanism (clean context per attempt + auth cookie verification)
     const maxLoginAttempts = 3;
 
     for (let attempt = 1; attempt <= maxLoginAttempts; attempt++) {
       console.log(`[Monitor] Login attempt ${attempt}/${maxLoginAttempts}...`);
+      const context = await browser.newContext();
+      const newPage = await context.newPage();
+
       try {
         console.log('[Monitor] Navigating to FonixWeb homepage...');
-        await page.goto('https://fonixweb.szakrendelo16.hu/FonixWeb/Default.aspx', { timeout: 30000 });
-        await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+        await newPage.goto('https://fonixweb.szakrendelo16.hu/FonixWeb/Default.aspx', { timeout: 30000 });
+        await newPage.waitForLoadState('domcontentloaded');
 
         console.log('[Monitor] Clicking login button...');
-        await page.click('div.BigMenuCitizen', { timeout: 10000 });
-        await page.waitForSelector('#ctl00_cphMaster_txtPopupLoginName_Txt', { state: 'visible', timeout: 10000 });
+        await newPage.click('div.BigMenuCitizen', { timeout: 10000 });
+        await newPage.waitForSelector('#ctl00_cphMaster_txtPopupLoginName_Txt', { state: 'visible', timeout: 10000 });
 
         console.log('[Monitor] Filling in login details...');
-        await page.fill('#ctl00_cphMaster_txtPopupLoginName_Txt', USERNAME);
-        await page.fill('#ctl00_cphMaster_txtPopupLoginPwd_Txt', PASSWORD);
+        await newPage.fill('#ctl00_cphMaster_txtPopupLoginName_Txt', USERNAME);
+        await newPage.fill('#ctl00_cphMaster_txtPopupLoginPwd_Txt', PASSWORD);
 
         console.log('[Monitor] Submitting credentials...');
-        await Promise.all([
-          page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {}),
-          page.click('#ctl00_cphMaster_btnPopupLoginCitizenLogin')
-        ]);
+        await newPage.click('#ctl00_cphMaster_btnPopupLoginCitizenLogin');
 
-        await page.waitForTimeout(3000);
-        console.log('[Monitor] URL after login attempt:', page.url());
+        // Wait for ASP.NET authentication cookie (.ASPXFORMSAUTHFONIXWEB)
+        let authenticated = false;
+        for (let i = 0; i < 30; i++) {
+          await newPage.waitForTimeout(500);
+          const cookies = await context.cookies();
+          if (cookies.some(c => c.name.toLowerCase().includes('auth'))) {
+            authenticated = true;
+            break;
+          }
+        }
 
-        console.log('[Monitor] Navigating to Appointment page...');
-        await page.goto('https://fonixweb.szakrendelo16.hu/FonixWeb/Member/Appointment.aspx', { timeout: 30000 });
-        await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-
-        const currentUrl = page.url();
-        if (currentUrl.includes('Default.aspx?ReturnUrl=')) {
-          console.warn(`[Monitor] Login attempt ${attempt} failed: redirected to login URL (${currentUrl}).`);
-        } else {
-          console.log('[Monitor] Waiting for doctor selection popup...');
-          await page.waitForSelector('#selPopupAppMt', { state: 'visible', timeout: 15000 });
-          loginSuccess = true;
-          console.log('[Monitor] Login successful!');
+        if (!authenticated) {
+          console.warn(`[Monitor] Login attempt ${attempt}: Auth cookie not received after submitting credentials.`);
+          await context.close().catch(() => {});
+          if (attempt < maxLoginAttempts) {
+            console.log('[Monitor] Waiting 5 seconds before retrying login...');
+            await new Promise(r => setTimeout(r, 5000));
+            continue;
+          }
           break;
         }
+
+        console.log('[Monitor] Auth cookie verified. Navigating to Appointment page...');
+        await newPage.goto('https://fonixweb.szakrendelo16.hu/FonixWeb/Member/Appointment.aspx', { timeout: 30000 });
+
+        const currentUrl = newPage.url();
+        if (currentUrl.includes('Default.aspx?ReturnUrl=')) {
+          console.warn(`[Monitor] Login attempt ${attempt} failed: redirected to login URL (${currentUrl}).`);
+          await context.close().catch(() => {});
+          if (attempt < maxLoginAttempts) {
+            console.log('[Monitor] Waiting 5 seconds before retrying login...');
+            await new Promise(r => setTimeout(r, 5000));
+            continue;
+          }
+          break;
+        }
+
+        console.log('[Monitor] Waiting for doctor selection popup...');
+        await newPage.waitForSelector('#selPopupAppMt option', { state: 'attached', timeout: 15000 });
+        activeContext = context;
+        page = newPage;
+        console.log('[Monitor] Login successful!');
+        break;
       } catch (loginErr) {
         console.warn(`[Monitor] Error during login attempt ${attempt}:`, loginErr.message);
-      }
-
-      if (attempt < maxLoginAttempts) {
-        console.log('[Monitor] Waiting 5 seconds before retrying login...');
-        await page.waitForTimeout(5000);
+        await context.close().catch(() => {});
+        if (attempt < maxLoginAttempts) {
+          console.log('[Monitor] Waiting 5 seconds before retrying login...');
+          await new Promise(r => setTimeout(r, 5000));
+        }
       }
     }
 
-    if (!loginSuccess) {
-      console.error('[Monitor] All login attempts failed. Unable to access Appointment page.');
-      await browser.close();
-      process.exit(1);
+    if (!page) {
+      console.warn('[Monitor] All login attempts failed. FőnixWeb may be temporarily down or undergoing maintenance.');
+      console.warn('[Monitor] Skipping this run cleanly until next scheduled execution.');
+      await browser.close().catch(() => {});
+      return;
     }
 
     // 2. Iterate over unique doctors
@@ -239,9 +266,10 @@ async function run() {
         // Find largest max_weeks requested for this doctor
         const docMaxWeeks = Math.max(...docMonitors.map(m => m.max_weeks || GLOBAL_MAX_WEEKS));
 
-        if (d > 0) {
+        const isPopupOpen = await page.isVisible('#selPopupAppMt');
+        if (!isPopupOpen) {
           await page.click('#ctl00_cphMaster_hlAppmtList');
-          await page.waitForSelector('#selPopupAppMt', { state: 'visible', timeout: 10000 });
+          await page.waitForSelector('#selPopupAppMt option', { state: 'attached', timeout: 10000 });
         }
 
         // Fetch the actual doctor name from the select options
@@ -386,7 +414,10 @@ async function run() {
   } catch (err) {
     console.error('[Monitor] Fatal error during scraping session:', err);
   } finally {
-    await browser.close();
+    if (activeContext) {
+      await activeContext.close().catch(() => {});
+    }
+    await browser.close().catch(() => {});
     console.log('[Monitor] Browser closed.');
   }
 
@@ -481,4 +512,6 @@ async function parseCalendarPage(page) {
   });
 }
 
-run();
+run().catch(err => {
+  console.error('[Monitor] Unexpected error during execution:', err);
+});
